@@ -29,6 +29,8 @@ from transformers.trainer_pt_utils import LabelSmoother
 
 from fastchat.conversation import SeparatorStyle
 from fastchat.model.model_adapter import get_conversation_template
+from fastchat.conversation import split_llama3_turns, split_llama3_response
+# from transformers.models.llama import LlamaModel
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
@@ -56,6 +58,9 @@ class DataArguments:
         default=None, metadata={"help": "Path to the evaluation data."}
     )
     lazy_preprocess: bool = False
+    data_size: int = field(
+        default=-1, metadata={"help": "Number of examples to use for training."}
+    )
 
 
 @dataclass
@@ -121,9 +126,10 @@ def preprocess(
     targets = input_ids.clone()
 
     assert conv.sep_style == SeparatorStyle.ADD_COLON_TWO
+    # import pdb; pdb.set_trace()
 
     # Mask targets. Only compute loss on the assistant outputs.
-    sep = conv.sep + conv.roles[1] + ": "
+    sep = conv.sep + conv.roles[1] + ": "   # for vicuna, sep = ' ASSISTANT: '
     for conversation, target in zip(conversations, targets):
         total_len = int(target.ne(tokenizer.pad_token_id).sum())
 
@@ -138,7 +144,7 @@ def preprocess(
             parts = turn.split(sep)
             if len(parts) != 2:
                 break
-            parts[0] += sep
+            parts[0] += sep   # here parts[0] = instruction + ASSISTANT: 
             # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
             instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
@@ -177,15 +183,127 @@ def preprocess(
     )
 
 
+def preprocess_llama3(
+    sources,
+    tokenizer: transformers.PreTrainedTokenizer,
+) -> Dict:
+    conv = get_conversation_template("llama-3")
+    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+    # Apply prompt templates
+    conversations = []
+    for i, source in enumerate(sources):
+        continue_flag = False
+        if not source:   # for ShareGPT, the conversation can be empty
+            continue
+        if source[0]["from"] not in roles:   # for ShareGPT, the conversation can be "system"
+            continue
+        if roles[source[0]["from"]] != conv.roles[0]:
+            # Skip the first one if it is not from human
+            source = source[1:]
+
+        conv.messages = []
+        for j, sentence in enumerate(source):
+            role = roles[sentence["from"]]
+            if role != conv.roles[j % 2]:
+                continue_flag = True
+                break
+            # assert role == conv.roles[j % 2], f"{i}"
+            conv.append_message(role, sentence["value"])
+        if continue_flag:
+            continue
+        conversations.append(conv.get_prompt())
+
+    # Tokenize conversations
+    input_ids = tokenizer(
+        conversations,
+        return_tensors="pt",
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+    ).input_ids
+    targets = input_ids.clone()
+
+    assert conv.sep_style == SeparatorStyle.LLAMA3   
+
+    # Mask targets. Only compute loss on the assistant outputs.
+    # import pdb; pdb.set_trace()
+    num_beyond_1024 = 0
+    num_beyond_2048 = 0
+    total_num = 0
+
+    # import pdb; pdb.set_trace()
+
+    for conversation, target in zip(conversations, targets):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+
+        turns = split_llama3_turns(conversation)
+        cur_len = 1
+        target[:cur_len] = IGNORE_TOKEN_ID
+        for i, turn in enumerate(turns):
+            if turn == "":
+                break
+            turn_len = len(tokenizer(turn).input_ids)
+
+            total_num += 1
+            if turn_len > 1024:
+                num_beyond_1024 += 1
+            if turn_len > 2048:
+                num_beyond_2048 += 1
+
+            parts = split_llama3_response(turn)
+            if len(parts) != 2:
+                break
+            instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+
+            if i != 0:
+                instruction_len += 1
+
+            # Ignore the user instructions
+            target[cur_len : cur_len + instruction_len] = IGNORE_TOKEN_ID
+            cur_len += turn_len - 1
+
+            if i != 0:
+                cur_len += 1
+
+        # import pdb; pdb.set_trace()
+        target[cur_len:] = IGNORE_TOKEN_ID
+
+        if False:  # Inspect and check the correctness of masking
+            z = target.clone()
+            z = torch.where(z == IGNORE_TOKEN_ID, tokenizer.unk_token_id, z)
+            rank0_print(tokenizer.decode(z))
+            exit()
+
+        if cur_len < tokenizer.model_max_length:
+            if cur_len != total_len:
+                target[:] = IGNORE_TOKEN_ID
+                rank0_print(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
+                    f" #turn = {len(turns) - 1}. (ignored)"
+                )
+    print(f"num_beyond_1024: {num_beyond_1024}, num_beyond_2048: {num_beyond_2048}, total_num: {total_num}")
+    # exit()
+    return dict(
+        input_ids=input_ids,
+        labels=targets,
+        attention_mask=input_ids.ne(tokenizer.pad_token_id),
+    )
+
+
+
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, raw_data, tokenizer: transformers.PreTrainedTokenizer):
+    def __init__(self, raw_data, data_args, tokenizer: transformers.PreTrainedTokenizer):
         super(SupervisedDataset, self).__init__()
 
         rank0_print("Formatting inputs...")
-        sources = [example["conversations"] for example in raw_data]
-        data_dict = preprocess(sources, tokenizer)
+        if data_args.data_size > 0:
+            sources = [example["conversations"] for example in raw_data][:data_args.data_size]
+        else:
+            sources = [example["conversations"] for example in raw_data]
+        data_dict = preprocess_llama3(sources, tokenizer)
 
         self.input_ids = data_dict["input_ids"]
         self.labels = data_dict["labels"]
@@ -236,13 +354,16 @@ def make_supervised_data_module(
     tokenizer: transformers.PreTrainedTokenizer, data_args
 ) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
+    # dataset_cls = (
+    #     LazySupervisedDataset if data_args.lazy_preprocess else SupervisedDataset
+    # )
     dataset_cls = (
-        LazySupervisedDataset if data_args.lazy_preprocess else SupervisedDataset
+        SupervisedDataset
     )
     rank0_print("Loading data...")
 
     train_json = json.load(open(data_args.data_path, "r"))
-    train_dataset = dataset_cls(train_json, tokenizer=tokenizer)
+    train_dataset = dataset_cls(train_json, data_args, tokenizer=tokenizer)
 
     if data_args.eval_data_path:
         eval_json = json.load(open(data_args.eval_data_path, "r"))

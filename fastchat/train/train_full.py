@@ -162,9 +162,9 @@ def train():
             model.is_parallelizable = True
             model.model_parallel = True
 
-    model = get_peft_model(model, lora_config)
+    # model = get_peft_model(model, lora_config)
 
-    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  Lora using  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  Lora Disabled  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
     if training_args.flash_attn:
         for name, module in model.named_modules():
@@ -200,23 +200,18 @@ def train():
     else:
         tokenizer.pad_token = tokenizer.unk_token
 
-    print('tokenizer setted!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = Trainer(
         model=model, tokenizer=tokenizer, args=training_args, **data_module
     )
-    print('trainer created!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
 
     model.config.use_cache = False
-    
+
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
     trainer.save_state()
-
-    print('trainer train passed!!!!!!!!!!!!!!!!!!!!!!!!!!!')
 
     # check if zero3 mode enabled
     if deepspeed.is_deepspeed_zero3_enabled():
